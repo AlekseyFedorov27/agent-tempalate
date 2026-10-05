@@ -1,0 +1,183 @@
+import re
+from collections.abc import AsyncIterator
+from typing import Any
+
+from langchain_core.messages import HumanMessage
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
+
+from app.agent.schemas import MessageOut
+from app.runs.models import EventType
+
+
+# --------------------------------------------------------------------------- #
+# Сериализация сообщений
+# --------------------------------------------------------------------------- #
+
+def _content_to_str(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(b.get("text", b)) if isinstance(b, dict) else str(b) for b in content
+        )
+    return str(content)
+
+
+def _ensure_markdown(text: str) -> str:
+    """
+    Мягкая страховка: если модель вернула plain text, разбиваем его
+    на абзацы, чтобы markdown-it сделал <p>, а не склеил в одну строку.
+    Уже размеченный текст не трогаем.
+    """
+    if not text or not text.strip():
+        return text
+    if re.search(r"(^#{1,6} |\*\*.+?\*\*|```|^\s*[-*] |^\s*\d+\. )", text, re.M):
+        return text
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    return "\n\n".join(paragraphs)
+
+
+def _message_to_dict(m: Any) -> dict:
+    msg_type = getattr(m, "type", m.__class__.__name__.lower())
+    content = _content_to_str(getattr(m, "content", ""))
+    tool_calls = getattr(m, "tool_calls", None) or None
+
+    # К ai-сообщениям без tool_calls применяем markdown-страховку
+    if msg_type == "ai" and not tool_calls and content:
+        content = _ensure_markdown(content)
+
+    return {
+        "type": msg_type,
+        "content": content,
+        "tool_calls": tool_calls,
+    }
+
+
+def _serialize_messages(messages: list) -> list[MessageOut]:
+    return [MessageOut(**_message_to_dict(m)) for m in messages]
+
+
+# --------------------------------------------------------------------------- #
+# Runtime
+# --------------------------------------------------------------------------- #
+
+class AgentRuntimeService:
+    def __init__(self, graph: CompiledStateGraph):
+        self.graph = graph
+
+    def _config(self, thread_id: str) -> dict:
+        return {"configurable": {"thread_id": thread_id}}
+
+    # --- Базовые операции -------------------------------------------------- #
+
+    async def start_run(
+        self,
+        thread_id: str,
+        message: str,
+        *,
+        user_name: str = "",
+        system_prompt: str = "",
+    ) -> dict:
+        return await self.graph.ainvoke(
+            {
+                "messages": [HumanMessage(content=message)],
+                "user_name": user_name,
+                "system_prompt": system_prompt,
+            },
+            config=self._config(thread_id),
+        )
+
+    async def resume_run(self, thread_id: str, resume_value: dict) -> dict:
+        return await self.graph.ainvoke(
+            Command(resume=resume_value),
+            config=self._config(thread_id),
+        )
+
+    async def get_state(self, thread_id: str):
+        return await self.graph.aget_state(self._config(thread_id))
+
+    @staticmethod
+    def get_pending_interrupts(state) -> list[dict]:
+        result: list[dict] = []
+        for task in (getattr(state, "tasks", None) or []):
+            for intr in (getattr(task, "interrupts", None) or []):
+                result.append(
+                    {
+                        "id": getattr(intr, "id", None),
+                        "value": getattr(intr, "value", None),
+                    }
+                )
+        return result
+
+    # --- Чистка чекпоинтов ------------------------------------------------- #
+
+    async def delete_thread_checkpoints(self, thread_id: str) -> None:
+        """
+        Чистит LangGraph-чекпоинты по thread_id.
+        У AsyncPostgresSaver есть метод adelete_thread; если его нет —
+        просто ничего не делаем (не критично, thread_id — UUID и не переиспользуется).
+        """
+        saver = getattr(self.graph, "checkpointer", None)
+        if saver is None:
+            return
+        deleter = getattr(saver, "adelete_thread", None)
+        if deleter is None:
+            return
+        try:
+            await deleter(thread_id)
+        except Exception:
+            # Не валим всю операцию из-за чекпоинтов
+            pass
+
+    # --- Streaming --------------------------------------------------------- #
+
+    async def stream_events(
+        self,
+        thread_id: str,
+        message: str,
+        *,
+        user_name: str = "",
+        system_prompt: str = "",
+    ) -> AsyncIterator[dict]:
+        """
+        Асинхронный генератор событий графа.
+
+        Yields:
+            {"type": "node", "data": {"event_type": str, "payload": dict}}
+            {"type": "token", "data": {"content": str}}
+        """
+        async for mode, chunk in self.graph.astream(
+            {
+                "messages": [HumanMessage(content=message)],
+                "user_name": user_name,
+                "system_prompt": system_prompt,
+            },
+            config=self._config(thread_id),
+            stream_mode=["updates", "messages"],
+        ):
+            if mode == "updates":
+                for node_name, node_output in chunk.items():
+                    if not isinstance(node_output, dict):
+                        continue
+                    messages = node_output.get("messages") or []
+                    payload = {
+                        "node": node_name,
+                        "messages": [_message_to_dict(m) for m in messages],
+                    }
+                    if node_name == "llm":
+                        event_type = EventType.LLM_END
+                    elif node_name == "tools":
+                        event_type = EventType.TOOL_END
+                    else:
+                        event_type = EventType.NODE_UPDATE
+                    yield {
+                        "type": "node",
+                        "data": {"event_type": event_type, "payload": payload},
+                    }
+            elif mode == "messages":
+                msg_chunk, meta = chunk
+                if meta.get("langgraph_node") == "llm":
+                    content = getattr(msg_chunk, "content", "")
+                    if content:
+                        yield {"type": "token", "data": {"content": str(content)}}    

@@ -1,0 +1,14 @@
+__pycache__/
+*.db-wal
+*.db-shm
+.pytest_cache
+.env
+frontend/node_modules/
+
+print.py
+project_dump.txt
+text.txt
+tests.log
+body.json
+дальше.txt
+правки.txt
